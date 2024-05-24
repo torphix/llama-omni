@@ -138,6 +138,7 @@ class GPTConfig:
         True  # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     )
     output_heads: int = 1
+    n_input_emb: int = 1
 
 
 class GPT(nn.Module):
@@ -150,6 +151,14 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(
             dict(
+                # Audio token embeddings
+                ates=nn.ModuleList(
+                    [
+                        nn.Embedding(config.vocab_size, config.n_embd)
+                        for _ in range(config.n_input_emb)
+                    ]
+                ),
+                # Text token embeddings
                 wte=nn.Embedding(config.vocab_size, config.n_embd),
                 wpe=nn.Embedding(config.block_size, config.n_embd),
                 drop=nn.Dropout(config.dropout),
@@ -167,9 +176,8 @@ class GPT(nn.Module):
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_heads[
-            0
-        ].weight  # https://paperswithcode.com/method/weight-tying
+        for i in range(config.n_input_emb):
+            self.transformer.ates[i].weight = self.lm_heads[i].weight
 
         # init all weights
         self.apply(self._init_weights)
@@ -203,18 +211,42 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
-        device = idx.device
-        b, t = idx.size()
+    def forward(self, text_idx=None, audio_idx=None, targets=None):
+        device = audio_idx.device
+        b, n_codes, t = audio_idx.size()
+
         assert (
             t <= self.config.block_size
         ), f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        assert (
+            text_idx is not None or audio_idx is not None
+        ), "Either text_idx or audio_idx must be provided"
+
         pos = torch.arange(0, t, dtype=torch.long, device=device)  # shape (t)
 
-        # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos)  # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        if audio_idx is not None:
+            # Get audio emb
+            audio_tok_embs = [
+                self.transformer.ates[i](audio_idx[:, i, :]).unsqueeze(1)
+                for i in range(n_codes)
+            ]  # token embeddings of shape (b, t, n_embd)
+            audio_tok_emb = torch.cat(audio_tok_embs, dim=1)
+            pos_emb = self.transformer.wpe(
+                pos
+            )  # position embeddings of shape (t, n_embd)
+            x = audio_tok_emb + pos_emb
+            x = self.transformer.drop(x)
+            x = x.reshape(b, t * n_codes, -1)
+        # Get text emb
+        if text_idx is not None:
+            text_emb = self.transformer.wte(text_idx)
+            # Get text pos emb
+            text_pos_emb = self.transformer.wpe(pos)
+            x = text_emb + text_pos_emb
+            x = self.transformer.drop(x)
+            # merge audio and text embeddings
+            x = torch.cat((x, audio_tok_emb), dim=1)
+
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
@@ -270,7 +302,9 @@ class GPT(nn.Module):
             "gpt2-large": dict(
                 n_layer=36, n_head=20, n_embd=1280, **config_kwargs
             ),  # 774M params
-            "gpt2-xl": dict(n_layer=48, n_head=25, n_embd=1600, **config_kwargs),  # 1558M params
+            "gpt2-xl": dict(
+                n_layer=48, n_head=25, n_embd=1600, **config_kwargs
+            ),  # 1558M params
         }[model_type]
         print("forcing vocab_size=50257, block_size=1024, bias=True")
         config_args["vocab_size"] = 50257  # always 50257 for GPT model checkpoints
@@ -320,7 +354,7 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k].t())
             else:
                 # Skip lm_heads
-                if k.startswith("lm_head"):
+                if k.startswith("lm_head") or k.startswith("transformer.wte"):
                     continue
                 # vanilla copy over the other parameters
                 assert sd_hf[k].shape == sd[k].shape
@@ -392,7 +426,7 @@ class GPT(nn.Module):
                 else idx[:, -self.config.block_size :]
             )
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            logits, _ = self(audio_idx=idx_cond)
             logits = logits[:, :, :] / temperature
             # optionally crop the logits to only the top k options
             if top_k is not None:
@@ -403,23 +437,27 @@ class GPT(nn.Module):
             # Iterate over each output head
             selected_indices = []
             for i in range(probs.shape[1]):
-            # sample from the distribution
+                # sample from the distribution
                 idx_next = torch.multinomial(probs[:, i, :], num_samples=1)
                 selected_indices.append(idx_next)
             # append sampled index to the running sequence and continue
             selected_indices = torch.cat(selected_indices, dim=1)
-            idx = torch.cat((idx, selected_indices), dim=1)
+            idx = torch.cat((idx, selected_indices.unsqueeze(-1)), dim=-1)
 
         return idx
 
 
 if __name__ == "__main__":
-    model = GPT.from_pretrained("gpt2", config_kwargs={"output_heads": 4})
+    model = GPT.from_pretrained(
+        "gpt2", config_kwargs={"output_heads": 6, "n_input_emb": 6}
+    )
     print(model)
 
-    x = torch.randint(0, 100, (1, 100))
-    logits, loss = model(x)
+    # These are audio tokens
+    x = torch.randint(0, 100, (1, 6, 100))
+    #
+    logits, loss = model(audio_idx=x)
     print(logits.shape)
-    logits= model.generate(x, 30)
+    logits = model.generate(x, 30)
 
     print(logits.shape)
